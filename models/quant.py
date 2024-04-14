@@ -187,8 +187,10 @@ class VectorQuantizer2(nn.Module):
     def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference
         HW = self.v_patch_nums[-1]
         if si != SN-1:
+            # self.quant_resi是Φk，由卷积层实现，插值到最大的分辨率
             h = self.quant_resi[si/(SN-1)](F.interpolate(h_BChw, size=(HW, HW), mode='bicubic'))     # conv after upsample
             f_hat.add_(h)
+            # 插值到下一分辨率
             return f_hat, F.interpolate(f_hat, size=(self.v_patch_nums[si+1], self.v_patch_nums[si+1]), mode='area')
         else:
             h = self.quant_resi[si/(SN-1)](h_BChw)

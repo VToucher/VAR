@@ -62,7 +62,7 @@ class VAR(nn.Module):
         init_std = math.sqrt(1 / self.C / 3)
         self.num_classes = num_classes
         self.selecting_idx = torch.full((1, num_classes), fill_value=1/num_classes, dtype=torch.float32, device=dist.get_device())
-        self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
+        self.class_emb = nn.Embedding(self.num_classes + 1, self.C)  # self.C=1024
         nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
@@ -127,10 +127,10 @@ class VAR(nn.Module):
         self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
         
         # 6. classifier head
-        if self.using_aln:
+        if self.using_aln:  # true
             self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
             self.head = nn.Linear(self.C, self.V)
-        else:
+        else:  # false
             self.head_nm = MultiInpIdentity()
             self.head = nn.Sequential(norm_layer(self.C), nn.Linear(self.C, self.V))
     
@@ -140,6 +140,7 @@ class VAR(nn.Module):
             h = resi + self.gamma2_last * self.blocks[-1].drop_path(h)
         else:   # is h, so fused_add_norm is not used, and self.gamma2_last is None
             h = h_or_h_and_residual
+        # AdaLN式结合x和cond，分类head=FC(1024,4096)
         return self.head(self.head_nm(h.float(), cond_BD).float()).float()
     
     @torch.no_grad()
@@ -159,51 +160,69 @@ class VAR(nn.Module):
         :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
         :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
         """
-        if g_seed is None: rng = None
-        else: self.rng.manual_seed(g_seed); rng = self.rng
+        # 1. 设置rng及其随机种子
+        if g_seed is None: rng = None  # false, g_seed=0
+        else: self.rng.manual_seed(g_seed); rng = self.rng  # true
         
+        # 2. 获得bs个ImageNet图片序号，给定或随机生成
         if label_B is None:
             label_B = torch.multinomial(self.selecting_idx, num_samples=B, replacement=True, generator=rng).reshape(B)
         elif isinstance(label_B, int):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
+        # 3. class emb：label_B后面再接8个，序号为最大类别数1024，得到shape=[16]，再emb至1024维，shape=[16, 1024]
         sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
         
-        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
-        
+        # 4. position emb + level emb
+        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC  # [1,680,1024]
+        # 5. class + pos_start + lvl_pos
+        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]  # [16,1,1024]
+        # 6. 初始化两个参数
         cur_L = 0
-        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])  # [8,32,16,16]全0
         
+        # 7. 打开AdaLNSA的kv cache
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
-            ratio = si / self.num_stages_minus_1
+            
+            # 8. 循环步骤比例和当前分辨率
+            ratio = si / self.num_stages_minus_1  # si/9
             # last_L = cur_L
             cur_L += pn*pn
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            
+            # 9. x和cond送入attention blcok，cond通过AdaLN的参数加入网络
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD)  # [16,1024], Identity()
             SABlock.forward
-            x = next_token_map
+            x = next_token_map  # [16,1,1024]
             for b in self.blocks:
                 x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD)
+
+            # 10. 获得logits
+            logits_BlV = self.get_logits(x, cond_BD)  # [16, 1, 4096]
             
+            # 11. 以cfg和分辨率比例，做条件控制
             t = cfg * ratio
-            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
+            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]  # [8, 1, 4096]
             
+            # 12. 根据topk和top-p，采样概率最大的idx
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-            if not more_smooth:
-                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
-            else:
+            
+            # 13. 查得VQVAE中该idx对应的emb
+            if not more_smooth:  # true
+                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae = [8,1,32]
+            else:  # false
                 gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
                 h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
             
-            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)  # [8,32,1,1]
+            
+            # 14. 
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
             if si != self.num_stages_minus_1:   # prepare for next stage
-                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
-                next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
+                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)  # [8,4,32]
+                next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]  # [8,4,1024]
+                next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG  [16,4,1024]
         
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]

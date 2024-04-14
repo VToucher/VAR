@@ -67,12 +67,14 @@ torch.backends.cudnn.allow_tf32 = bool(tf32)
 torch.backends.cuda.matmul.allow_tf32 = bool(tf32)
 torch.set_float32_matmul_precision('high' if tf32 else 'highest')
 
+# -----------------------------------------------------------------------------------------------------------------------
 # sample
-B = len(class_labels)
+B = len(class_labels)  # 8
 label_B: torch.LongTensor = torch.tensor(class_labels, device=device)
 with torch.inference_mode():
     with torch.autocast('cuda', enabled=True, dtype=torch.float16, cache_enabled=True):    # using bfloat16 can be faster
         recon_B3HW = var.autoregressive_infer_cfg(B=B, label_B=label_B, cfg=cfg, top_k=900, top_p=0.95, g_seed=seed)
+# -----------------------------------------------------------------------------------------------------------------------
 
 chw = torchvision.utils.make_grid(recon_B3HW, nrow=8, padding=0, pad_value=1.0)
 chw = chw.permute(1, 2, 0).mul_(255).cpu().numpy()
